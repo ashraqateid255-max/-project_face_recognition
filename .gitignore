@@ -1,0 +1,26 @@
+# Generated at runtime — never commit these
+attendance_app.db
+database.db
+knn_model.pkl
+encodings.pickle
+
+# Local employee photo dataset (path is machine-specific anyway)
+data set/
+dataset/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

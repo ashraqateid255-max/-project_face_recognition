@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+face_recognition
+numpy
+Pillow
+scikit-learn
+streamlit
+requests
