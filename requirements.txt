@@ -2,8 +2,10 @@ fastapi
 uvicorn[standard]
 python-multipart
 face_recognition
-numpy
-Pillow
+dlib
 scikit-learn
+numpy
+opencv-python
+Pillow
 streamlit
 requests
