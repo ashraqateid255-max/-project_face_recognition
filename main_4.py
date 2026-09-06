@@ -4,6 +4,7 @@ from sklearn.neighbors import KNeighborsClassifier
 import face_recognition
 import pickle
 import numpy as np
+import cv2
 from PIL import Image
 import io
 import sqlite3
@@ -176,6 +177,64 @@ def match_face(face_encoding, threshold=0.5):
     return None
 
 
+# ------------------------------------------------------------------
+# LIVENESS / ANTI-SPOOF CHECK
+#
+# Everything above only answers "whose face is this?" — it says nothing
+# about whether the camera is looking at a live person or a printed
+# photo / phone screen held up to it. This function is the single place
+# that answers that second question, so every endpoint that accepts a
+# face photo can call it the same way.
+#
+# IMPORTANT: this is a lightweight heuristic (sharpness + reflection
+# check via OpenCV), not a trained anti-spoofing model. It will catch
+# obviously blurry printouts or a phone screen's glare, but a good photo
+# printed on quality paper, or a good screen replay, CAN bypass it.
+# For real protection before relying on this in production, swap the
+# body of this function for a proper model such as:
+#   - Silent-Face-Anti-Spoofing (https://github.com/minivision-ai/Silent-Face-Anti-Spoofing)
+#   - DeepFace with anti_spoofing=True (https://github.com/serengil/deepface)
+# The call sites below don't need to change if you do that swap — only
+# this function's body does.
+# ------------------------------------------------------------------
+def is_real_face(rgb_img, face_location, blur_threshold=60.0, glare_ratio_threshold=0.03):
+    """Best-effort liveness heuristic. Returns True if the face crop looks
+    like a live capture, False if it looks like a printed photo or a
+    screen replay. face_location is a (top, right, bottom, left) tuple
+    as returned by face_recognition.face_locations().
+    """
+    try:
+        top, right, bottom, left = face_location
+        top, left = max(top, 0), max(left, 0)
+        face_crop = rgb_img[top:bottom, left:right]
+        if face_crop.size == 0:
+            return False
+
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY)
+
+        # 1) Printed photos and low-quality screen replays tend to lose
+        #    high-frequency detail (skin pores, fine texture). A live face
+        #    photographed reasonably close up has more of that detail, which
+        #    shows up as a higher variance in the Laplacian (edge) response.
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < blur_threshold:
+            return False
+
+        # 2) A phone/tablet screen held up to the camera very often produces
+        #    a small, tight blown-out highlight from screen glare that a real
+        #    face under normal room lighting doesn't produce in the same way.
+        _, bright_mask = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY)
+        glare_ratio = float(np.count_nonzero(bright_mask)) / gray.size
+        if glare_ratio > glare_ratio_threshold:
+            return False
+
+        return True
+    except Exception:
+        # If the liveness check itself fails for any reason, fail closed
+        # (treat as not-live) rather than silently letting the request through.
+        return False
+
+
 @app.get("/")
 def root():
     return {"status": "online", "message": "Face Attendance System API with KNN is running."}
@@ -196,12 +255,19 @@ async def signup(
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb_img = np.array(image)
-        face_encs = face_recognition.face_encodings(rgb_img)
+        face_locs = face_recognition.face_locations(rgb_img)
+        face_encs = face_recognition.face_encodings(rgb_img, face_locs)
     except Exception:
         return {"status": "error", "message": "Invalid image format."}
 
     if not face_encs:
         return {"status": "error", "message": "No face detected in photo."}
+
+    if not is_real_face(rgb_img, face_locs[0]):
+        return {
+            "status": "spoof_detected",
+            "message": "الصورة دي مش شكلها لايف (ممكن تكون صورة مطبوعة أو شاشة). صور نفسك على الطبيعة تاني.",
+        }
 
     encoding_blob = encoding_to_blob(face_encs[0])
 
@@ -235,12 +301,19 @@ async def login(file: UploadFile = File(...)):
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb_img = np.array(image)
-        face_encs = face_recognition.face_encodings(rgb_img)
+        face_locs = face_recognition.face_locations(rgb_img)
+        face_encs = face_recognition.face_encodings(rgb_img, face_locs)
     except Exception:
         return {"status": "error", "message": "Could not read that photo."}
 
     if not face_encs:
         return {"status": "error", "message": "No face detected in the photo."}
+
+    if not is_real_face(rgb_img, face_locs[0]):
+        return {
+            "status": "spoof_detected",
+            "message": "الصورة دي مش شكلها لايف. صور نفسك على الطبيعة تاني.",
+        }
 
     matched_user = match_face(face_encs[0])
 
@@ -269,8 +342,23 @@ async def login(file: UploadFile = File(...)):
 
 
 # 6. Check-In Endpoint
+#
+# expected_username MUST be supplied by the caller from the currently
+# logged-in session (i.e. whoever is actually sitting behind the app on
+# that device/session) — never left blank and never taken on faith from
+# a plain form field with no auth behind it, or this check is pointless.
+# The endpoint now checks TWO things before it accepts an attendance
+# record: (1) is this a live face, and (2) does the face in the photo
+# actually match the person whose page/session this is. Before this
+# change it only ever checked "whose face is this" and wrote attendance
+# under THAT name — meaning anyone could photograph a coworker while
+# sitting on their own logged-in page and mark attendance for that
+# coworker instead of themselves.
 @app.post("/attendance/check-in")
-async def check_in(file: UploadFile = File(...)):
+async def check_in(
+    expected_username: str = Form(...),
+    file: UploadFile = File(...)
+):
     try:
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -283,10 +371,22 @@ async def check_in(file: UploadFile = File(...)):
     if not face_encs:
         return {"status": "error", "message": "No face detected in image."}
 
+    if not is_real_face(rgb_img, face_locs[0]):
+        return {
+            "status": "spoof_detected",
+            "message": "الصورة دي مش شكلها لايف (ممكن تكون صورة مطبوعة أو شاشة).",
+        }
+
     matched_user = match_face(face_encs[0])
 
     if not matched_user:
         return {"status": "unknown_person", "message": "Face not recognized."}
+
+    if matched_user != expected_username:
+        return {
+            "status": "identity_mismatch",
+            "message": "الوش في الصورة مش نفس صاحب الحساب اللي داخل بيه دلوقتي.",
+        }
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -326,24 +426,40 @@ async def check_in(file: UploadFile = File(...)):
     }
 
 
-# 7. Check-Out Endpoint
+# 7. Check-Out Endpoint — same expected_username / liveness protections as check-in.
 @app.post("/attendance/check-out")
-async def check_out(file: UploadFile = File(...)):
+async def check_out(
+    expected_username: str = Form(...),
+    file: UploadFile = File(...)
+):
     try:
         image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         rgb_img = np.array(image)
-        face_encs = face_recognition.face_encodings(rgb_img)
+        face_locs = face_recognition.face_locations(rgb_img)
+        face_encs = face_recognition.face_encodings(rgb_img, face_locs)
     except Exception:
         return {"status": "error", "message": "Failed to read image."}
 
     if not face_encs:
         return {"status": "error", "message": "No face detected."}
 
+    if not is_real_face(rgb_img, face_locs[0]):
+        return {
+            "status": "spoof_detected",
+            "message": "الصورة دي مش شكلها لايف (ممكن تكون صورة مطبوعة أو شاشة).",
+        }
+
     matched_user = match_face(face_encs[0])
 
     if not matched_user:
         return {"status": "unknown_person", "message": "Face not recognized."}
+
+    if matched_user != expected_username:
+        return {
+            "status": "identity_mismatch",
+            "message": "الوش في الصورة مش نفس صاحب الحساب اللي داخل بيه دلوقتي.",
+        }
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
