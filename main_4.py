@@ -164,12 +164,8 @@ process_initial_dataset()
 knn_clf = train_knn_from_db()
 
 
-def match_face(face_encoding, threshold=0.5):
-    """The single source of truth for 'who owns this face' — used by /login,
-    /attendance/check-in, and /attendance/check-out for consistent results.
-    The KNN model is trained directly from the users table, so it will never
-    return a username that doesn't exist in the database.
-    """
+def match_face(face_encoding, threshold=0.4):
+    """The single source of truth for 'who owns this face'"""
     if knn_clf is None:
         return None
     try:
@@ -179,8 +175,6 @@ def match_face(face_encoding, threshold=0.5):
     except Exception:
         pass
     return None
-
-
 # ------------------------------------------------------------------
 # LIVENESS CHECK / ANTI-SPOOFING
 #
