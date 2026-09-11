@@ -1,4 +1,4 @@
-# Face Attendance & Auth System
+# FaceGate AI
 
 A face-recognition attendance system: employees sign up with a photo, then
 log in and check in/out by scanning their face — no passwords needed at
